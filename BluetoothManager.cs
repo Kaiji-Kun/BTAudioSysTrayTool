@@ -114,9 +114,180 @@ internal static class BluetoothManager
     public static bool Connect(string endpointId) =>
         SendOneShot(endpointId, KSPROPERTY_ONESHOT_RECONNECT);
 
-    /// <summary>Disconnect the device behind this endpoint via the audio driver.</summary>
-    public static bool Disconnect(string endpointId) =>
-        SendOneShot(endpointId, KSPROPERTY_ONESHOT_DISCONNECT);
+    /// <summary>
+    /// Fully disconnect the device behind this endpoint.
+    ///
+    /// The KS one-shot disconnect only stops the audio profiles. Some earphones keep
+    /// the underlying Bluetooth link (ACL) open afterwards because other services
+    /// (media controls / AVRCP, vendor channels) are still using it, so Windows keeps
+    /// showing them as "Connected" and they can't pair with another device. So:
+    ///   1. send the KS disconnect to every audio endpoint of this device
+    ///      (render + capture, A2DP + Hands-Free), not just the one in the list;
+    ///   2. then close the link itself with IOCTL_BTH_DISCONNECT_DEVICE, which is what
+    ///      the Settings "Disconnect" button effectively does.
+    /// </summary>
+    public static bool Disconnect(string endpointId)
+    {
+        var (containerId, name) = GetEndpointIdentity(endpointId);
+
+        // 1. Audio profiles, on every endpoint belonging to the same physical device.
+        var endpointIds = containerId is Guid c ? GetActiveEndpointsInContainer(c) : new List<string>();
+        if (!endpointIds.Contains(endpointId, StringComparer.OrdinalIgnoreCase))
+            endpointIds.Add(endpointId);
+
+        bool any = false;
+        foreach (var id in endpointIds)
+            any |= SendOneShot(id, KSPROPERTY_ONESHOT_DISCONNECT);
+
+        // 2. The Bluetooth link itself.
+        var addresses = FindBluetoothAddresses(containerId, name);
+        if (addresses.Count > 0)
+        {
+            Thread.Sleep(500); // let the audio driver finish tearing down its channels
+            foreach (var address in addresses)
+                any |= DisconnectLink(address);
+        }
+        return any;
+    }
+
+    /// <summary>Container ID (shared by all endpoints/interfaces of one physical device)
+    /// and friendly name of an audio endpoint.</summary>
+    private static (Guid? ContainerId, string Name) GetEndpointIdentity(string endpointId)
+    {
+        var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+        try
+        {
+            if (enumerator.GetDevice(endpointId, out var dev) < 0 || dev == null) return (null, "");
+            try { return (GetContainerId(dev), GetFriendlyName(dev)); }
+            finally { Marshal.ReleaseComObject(dev); }
+        }
+        catch { return (null, ""); }
+        finally { Marshal.ReleaseComObject(enumerator); }
+    }
+
+    /// <summary>All ACTIVE render and capture endpoints with the given container ID.</summary>
+    private static List<string> GetActiveEndpointsInContainer(Guid containerId)
+    {
+        var ids = new List<string>();
+        var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+        try
+        {
+            enumerator.EnumAudioEndpoints(EDataFlow.eAll, DEVICE_STATE_ACTIVE, out var collection);
+            collection.GetCount(out int count);
+            for (int i = 0; i < count; i++)
+            {
+                collection.Item(i, out var device);
+                try
+                {
+                    if (GetContainerId(device) == containerId)
+                    {
+                        device.GetId(out string id);
+                        ids.Add(id);
+                    }
+                }
+                finally { Marshal.ReleaseComObject(device); }
+            }
+            Marshal.ReleaseComObject(collection);
+        }
+        catch { /* best effort: caller still disconnects the original endpoint */ }
+        finally { Marshal.ReleaseComObject(enumerator); }
+        return ids;
+    }
+
+    private static Guid? GetContainerId(IMMDevice device)
+    {
+        IPropertyStore? store = null;
+        try
+        {
+            device.OpenPropertyStore(STGM_READ, out store);
+            var key = PKEY_Device_ContainerId;
+            store.GetValue(ref key, out var pv);
+            try
+            {
+                // VT_CLSID: the PROPVARIANT holds a pointer to the GUID.
+                if (pv.vt != VT_CLSID || pv.pwszVal == IntPtr.Zero) return null;
+                return Marshal.PtrToStructure<Guid>(pv.pwszVal);
+            }
+            finally { PropVariantClear(ref pv); }
+        }
+        catch { return null; }
+        finally { if (store != null) Marshal.ReleaseComObject(store); }
+    }
+
+    /// <summary>
+    /// Bluetooth addresses of the paired device(s) behind this endpoint: matched by
+    /// container ID, or by name if the endpoint has no container ID. Checks both
+    /// Classic and LE entries, since dual-mode earbuds can appear as both.
+    /// </summary>
+    private static List<ulong> FindBluetoothAddresses(Guid? containerId, string endpointName)
+    {
+        const string PropContainer = "System.Devices.Aep.ContainerId";
+        const string PropAddress = "System.Devices.Aep.DeviceAddress";
+        var result = new List<ulong>();
+        string cleanName = CleanName(endpointName);
+
+        string[] selectors =
+        {
+            Windows.Devices.Bluetooth.BluetoothDevice.GetDeviceSelectorFromPairingState(true),
+            Windows.Devices.Bluetooth.BluetoothLEDevice.GetDeviceSelectorFromPairingState(true),
+        };
+
+        foreach (var selector in selectors)
+        {
+            Windows.Devices.Enumeration.DeviceInformationCollection infos;
+            try
+            {
+                infos = Windows.Devices.Enumeration.DeviceInformation
+                    .FindAllAsync(selector, new[] { PropContainer, PropAddress },
+                        Windows.Devices.Enumeration.DeviceInformationKind.AssociationEndpoint)
+                    .AsTask().GetAwaiter().GetResult();
+            }
+            catch { continue; }
+
+            foreach (var di in infos)
+            {
+                bool match = containerId is Guid c
+                    ? di.Properties.TryGetValue(PropContainer, out var cv) && cv is Guid g && g == c
+                    : cleanName.Length > 0 &&
+                      string.Equals(CleanName(di.Name), cleanName, StringComparison.OrdinalIgnoreCase);
+                if (!match) continue;
+
+                if (di.Properties.TryGetValue(PropAddress, out var av) && av is string s &&
+                    TryParseBtAddress(s, out ulong address) && !result.Contains(address))
+                    result.Add(address);
+            }
+        }
+        return result;
+    }
+
+    // "aa:bb:cc:dd:ee:ff" (or with '-') -> 0xAABBCCDDEEFF
+    private static bool TryParseBtAddress(string s, out ulong address) =>
+        ulong.TryParse(s.Replace(":", "").Replace("-", ""),
+            System.Globalization.NumberStyles.HexNumber, null, out address) && address != 0;
+
+    /// <summary>Close the Bluetooth link to this address on every local radio.</summary>
+    private static bool DisconnectLink(ulong address)
+    {
+        bool ok = false;
+        var p = new BLUETOOTH_FIND_RADIO_PARAMS { dwSize = (uint)Marshal.SizeOf<BLUETOOTH_FIND_RADIO_PARAMS>() };
+        IntPtr find = BluetoothFindFirstRadio(ref p, out IntPtr radio);
+        if (find == IntPtr.Zero) return false;
+        try
+        {
+            do
+            {
+                try
+                {
+                    ok |= DeviceIoControl(radio, IOCTL_BTH_DISCONNECT_DEVICE,
+                        ref address, sizeof(ulong), IntPtr.Zero, 0, out _, IntPtr.Zero);
+                }
+                finally { CloseHandle(radio); }
+            }
+            while (BluetoothFindNextRadio(find, out radio));
+        }
+        finally { BluetoothFindRadioClose(find); }
+        return ok;
+    }
 
     private static bool SendOneShot(string endpointId, uint propertyId)
     {
@@ -259,6 +430,38 @@ internal static class BluetoothManager
     private struct PROPVARIANT { [FieldOffset(0)] public short vt; [FieldOffset(8)] public IntPtr pwszVal; }
 
     [DllImport("ole32.dll")] private static extern int PropVariantClear(ref PROPVARIANT pvar);
+
+    // PKEY_Device_ContainerId {8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c},2 (VT_CLSID)
+    private static PROPERTYKEY PKEY_Device_ContainerId = new()
+    { fmtid = new Guid("8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c"), pid = 2 };
+    private const short VT_CLSID = 72;
+
+    // ===================================================================
+    // Bluetooth link interop (bthioctl.h / bluetoothapis.h)
+    // ===================================================================
+
+    // BTH_CTL(BTH_IOCTL_BASE + 0x03) = CTL_CODE(FILE_DEVICE_BLUETOOTH, 0x03, METHOD_BUFFERED, FILE_ANY_ACCESS)
+    private const uint IOCTL_BTH_DISCONNECT_DEVICE = 0x0041000C;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BLUETOOTH_FIND_RADIO_PARAMS { public uint dwSize; }
+
+    [DllImport("BluetoothApis.dll", SetLastError = true)]
+    private static extern IntPtr BluetoothFindFirstRadio(ref BLUETOOTH_FIND_RADIO_PARAMS p, out IntPtr phRadio);
+
+    [DllImport("BluetoothApis.dll", SetLastError = true)]
+    private static extern bool BluetoothFindNextRadio(IntPtr hFind, out IntPtr phRadio);
+
+    [DllImport("BluetoothApis.dll", SetLastError = true)]
+    private static extern bool BluetoothFindRadioClose(IntPtr hFind);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(IntPtr hDevice, uint ioControlCode,
+        ref ulong inBuffer, uint inBufferSize, IntPtr outBuffer, uint outBufferSize,
+        out uint bytesReturned, IntPtr overlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
 
     [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] private class MMDeviceEnumerator { }
 
